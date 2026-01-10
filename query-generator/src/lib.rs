@@ -1633,7 +1633,7 @@ impl Arbitrary for BuiltinFunction {
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, Arbitrary)]
 #[arbitrary(args = QueryDialect)]
 pub enum SubqueryPosition {
-    Join(JoinOperator),
+    Join(#[strategy(join_operator_for_dialect(args.0))] JoinOperator),
     /// TODO, once we support them:
     ///
     /// - `extend_where_with: LogicalOp`
@@ -1685,7 +1685,7 @@ pub enum QueryOperation {
     ColumnAggregate(#[any(args_shared.dialect)] AggregateType),
     Filter(#[any(args_shared.dialect)] Filter),
     Distinct,
-    Join(JoinOperator),
+    Join(#[strategy(join_operator_for_dialect(args.dialect.0))] JoinOperator),
     ProjectLiteral,
     SingleParameter,
     MultipleParameters,
@@ -1729,6 +1729,37 @@ const JOIN_OPERATORS: &[JoinOperator] = &[
     JoinOperator::LeftOuterJoin,
     JoinOperator::InnerJoin,
 ];
+
+/// Generate a proptest Strategy for JoinOperator values that are valid for the given dialect.
+/// StraightJoin is MySQL-specific and not supported by PostgreSQL.
+fn join_operator_for_dialect(
+    dialect: ParseDialect,
+) -> impl proptest::strategy::Strategy<Value = JoinOperator> {
+    use proptest::sample::select;
+
+    match dialect {
+        ParseDialect::PostgreSQL => select(vec![
+            JoinOperator::Join,
+            JoinOperator::LeftJoin,
+            JoinOperator::LeftOuterJoin,
+            JoinOperator::RightJoin,
+            JoinOperator::RightOuterJoin,
+            JoinOperator::InnerJoin,
+            JoinOperator::CrossJoin,
+            // StraightJoin excluded - not supported by PostgreSQL
+        ]),
+        ParseDialect::MySQL => select(vec![
+            JoinOperator::Join,
+            JoinOperator::LeftJoin,
+            JoinOperator::LeftOuterJoin,
+            JoinOperator::RightJoin,
+            JoinOperator::RightOuterJoin,
+            JoinOperator::InnerJoin,
+            JoinOperator::CrossJoin,
+            JoinOperator::StraightJoin,
+        ]),
+    }
+}
 
 const DEFAULT_LIMIT: u64 = 3;
 
