@@ -2129,6 +2129,60 @@ impl TryFrom<&DfValue> for mysql_common::value::Value {
     }
 }
 
+/// Converts a text value to a Decimal for arithmetic operations.
+///
+/// This follows MySQL's behavior where text values are converted to numbers:
+/// - Numeric strings are parsed as Decimal
+/// - Non-numeric or empty strings are treated as 0
+fn text_to_decimal_for_arithmetic(s: &str) -> Decimal {
+    // MySQL behavior: parse the numeric prefix of the string
+    // "123abc" -> 123, "abc" -> 0, "" -> 0
+    let s = s.trim();
+    if s.is_empty() {
+        return Decimal::from(0);
+    }
+
+    // Try to parse as Decimal first
+    if let Ok(d) = s.parse::<Decimal>() {
+        return d;
+    }
+
+    // Try to extract a numeric prefix (MySQL-style behavior)
+    // Find the longest prefix that can be parsed as a number
+    let mut end = 0;
+    let mut has_dot = false;
+    let mut has_sign = false;
+
+    for (i, c) in s.char_indices() {
+        if c == '-' || c == '+' {
+            if has_sign || i > 0 {
+                break;
+            }
+            has_sign = true;
+            end = i + 1;
+        } else if c == '.' {
+            if has_dot {
+                break;
+            }
+            has_dot = true;
+            end = i + 1;
+        } else if c.is_ascii_digit() {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if end > 0 {
+        let prefix = &s[..end];
+        if let Ok(d) = prefix.parse::<Decimal>() {
+            return d;
+        }
+    }
+
+    Decimal::from(0)
+}
+
 // Performs an arithmetic operation on two numeric DfValues,
 // returning a new DfValue as the result.
 //
@@ -2212,6 +2266,54 @@ macro_rules! arithmetic_operation (
                 DfValue::from(a.$checked_op(&b))
             }
 
+            // Text/TinyText arithmetic - follows MySQL behavior where text is converted to numbers
+            // (treating non-numeric or empty strings as 0)
+            (first @ &DfValue::Text(..), second @ &DfValue::Int(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::UnsignedInt(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::Float(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::Double(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::Numeric(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::Int(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::UnsignedInt(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::Float(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::Double(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::Numeric(..)) |
+            (first @ &DfValue::Int(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::Int(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::UnsignedInt(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::UnsignedInt(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::Float(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::Float(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::Double(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::Double(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::Numeric(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::Numeric(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::Text(..), second @ &DfValue::TinyText(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::Text(..)) |
+            (first @ &DfValue::TinyText(..), second @ &DfValue::TinyText(..)) => {
+                let a: Decimal = match first {
+                    DfValue::Text(t) => text_to_decimal_for_arithmetic(t.as_str()),
+                    DfValue::TinyText(t) => text_to_decimal_for_arithmetic(t.as_str()),
+                    _ => Decimal::try_from(first)
+                        .map_err(|e| ReadySetError::DfValueConversionError {
+                            src_type: "DfValue".to_string(),
+                            target_type: "Decimal".to_string(),
+                            details: e.to_string(),
+                        })?,
+                };
+                let b: Decimal = match second {
+                    DfValue::Text(t) => text_to_decimal_for_arithmetic(t.as_str()),
+                    DfValue::TinyText(t) => text_to_decimal_for_arithmetic(t.as_str()),
+                    _ => Decimal::try_from(second)
+                        .map_err(|e| ReadySetError::DfValueConversionError {
+                            src_type: "DfValue".to_string(),
+                            target_type: "Decimal".to_string(),
+                            details: e.to_string(),
+                        })?,
+                };
+                DfValue::from(a.$checked_op(&b))
+            }
 
             (first, second) => return Err(invalid_query_err!(
                 "can't {} a {:?} and {:?}",
@@ -2866,7 +2968,167 @@ mod tests {
 
     #[test]
     fn invalid_arithmetic_returns_error() {
-        (&DfValue::from(0) + &DfValue::from("abc")).unwrap_err();
+        // Arithmetic between incompatible types (e.g., timestamps) should error
+        (&DfValue::TimestampTz(TimestampTz::zero()) + &DfValue::ByteArray(vec![].into()))
+            .unwrap_err();
+    }
+
+    #[test]
+    fn text_arithmetic_operations() {
+        // Text + Numeric: Text containing a number should be parsed
+        assert_eq!(
+            (&DfValue::from("5") + &DfValue::from(Decimal::new(3, 0))).unwrap(),
+            DfValue::from(Decimal::new(8, 0))
+        );
+
+        // Numeric + Text: Same as above
+        assert_eq!(
+            (&DfValue::from(Decimal::new(3, 0)) + &DfValue::from("5")).unwrap(),
+            DfValue::from(Decimal::new(8, 0))
+        );
+
+        // Text containing non-numeric string should be treated as 0
+        assert_eq!(
+            (&DfValue::from("abc") + &DfValue::from(Decimal::new(5, 0))).unwrap(),
+            DfValue::from(Decimal::new(5, 0))
+        );
+
+        // Empty string should be treated as 0
+        assert_eq!(
+            (&DfValue::from("") + &DfValue::from(Decimal::new(5, 0))).unwrap(),
+            DfValue::from(Decimal::new(5, 0))
+        );
+
+        // Text with numeric prefix (MySQL behavior)
+        assert_eq!(
+            (&DfValue::from("123abc") + &DfValue::from(Decimal::new(7, 0))).unwrap(),
+            DfValue::from(Decimal::new(130, 0))
+        );
+
+        // Text + Int
+        assert_eq!(
+            (&DfValue::from("10") + &DfValue::Int(5)).unwrap(),
+            DfValue::from(Decimal::new(15, 0))
+        );
+
+        // Int + Text
+        assert_eq!(
+            (&DfValue::Int(5) + &DfValue::from("10")).unwrap(),
+            DfValue::from(Decimal::new(15, 0))
+        );
+
+        // Text + UnsignedInt
+        assert_eq!(
+            (&DfValue::from("10") + &DfValue::UnsignedInt(5)).unwrap(),
+            DfValue::from(Decimal::new(15, 0))
+        );
+
+        // Text + Float
+        assert_eq!(
+            (&DfValue::from("10.5") + &DfValue::Float(2.5)).unwrap(),
+            DfValue::from(Decimal::new(13, 0))
+        );
+
+        // Text + Double
+        assert_eq!(
+            (&DfValue::from("10.5") + &DfValue::Double(2.5)).unwrap(),
+            DfValue::from(Decimal::new(13, 0))
+        );
+
+        // Text + Text (both numeric)
+        assert_eq!(
+            (&DfValue::from("10") + &DfValue::from("5")).unwrap(),
+            DfValue::from(Decimal::new(15, 0))
+        );
+
+        // Text + Text (one non-numeric)
+        assert_eq!(
+            (&DfValue::from("abc") + &DfValue::from("def")).unwrap(),
+            DfValue::from(Decimal::new(0, 0))
+        );
+
+        // Subtraction with text
+        assert_eq!(
+            (&DfValue::from("10") - &DfValue::from("3")).unwrap(),
+            DfValue::from(Decimal::new(7, 0))
+        );
+
+        // Multiplication with text
+        assert_eq!(
+            (&DfValue::from("10") * &DfValue::from("3")).unwrap(),
+            DfValue::from(Decimal::new(30, 0))
+        );
+
+        // Division with text
+        assert_eq!(
+            (&DfValue::from("10") / &DfValue::from("2")).unwrap(),
+            DfValue::from(Decimal::new(5, 0))
+        );
+
+        // Negative number in text
+        assert_eq!(
+            (&DfValue::from("-5") + &DfValue::from(Decimal::new(10, 0))).unwrap(),
+            DfValue::from(Decimal::new(5, 0))
+        );
+
+        // Decimal in text
+        assert_eq!(
+            (&DfValue::from("2.5") + &DfValue::from(Decimal::new(25, 1))).unwrap(),
+            DfValue::from(Decimal::new(5, 0))
+        );
+    }
+
+    #[test]
+    fn text_to_decimal_for_arithmetic_helper() {
+        use super::text_to_decimal_for_arithmetic;
+
+        // Simple integer
+        assert_eq!(text_to_decimal_for_arithmetic("123"), Decimal::new(123, 0));
+
+        // Decimal number
+        assert_eq!(
+            text_to_decimal_for_arithmetic("123.45"),
+            Decimal::new(12345, 2)
+        );
+
+        // Negative number
+        assert_eq!(
+            text_to_decimal_for_arithmetic("-123"),
+            Decimal::new(-123, 0)
+        );
+
+        // Empty string
+        assert_eq!(text_to_decimal_for_arithmetic(""), Decimal::new(0, 0));
+
+        // Whitespace only
+        assert_eq!(text_to_decimal_for_arithmetic("   "), Decimal::new(0, 0));
+
+        // Non-numeric string
+        assert_eq!(text_to_decimal_for_arithmetic("abc"), Decimal::new(0, 0));
+
+        // Numeric prefix
+        assert_eq!(
+            text_to_decimal_for_arithmetic("123abc"),
+            Decimal::new(123, 0)
+        );
+
+        // Whitespace around number
+        assert_eq!(
+            text_to_decimal_for_arithmetic("  123  "),
+            Decimal::new(123, 0)
+        );
+
+        // Leading zeros
+        assert_eq!(
+            text_to_decimal_for_arithmetic("00123"),
+            Decimal::new(123, 0)
+        );
+
+        // Positive sign
+        assert_eq!(
+            text_to_decimal_for_arithmetic("+123"),
+            Decimal::new(123, 0)
+        );
     }
 
     #[test]
